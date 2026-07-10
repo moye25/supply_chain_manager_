@@ -492,10 +492,11 @@ for task in tasks:
     shifted_start = planned_start + timedelta(days=DELAY_DAYS)
     shifted_end = shifted_start + timedelta(days=d["duration"])
 
-    vis_duration = max(d["duration"], MIN_BAR_DAYS)
-    planned_x.append(timedelta(days=vis_duration))
+    vis_duration_ms = max(d["duration"], MIN_BAR_DAYS) * 86400000  # days -> ms, since x-axis is date-typed
+    vis_duration = max(d["duration"], MIN_BAR_DAYS)  # kept in days for annotation placement below
+    planned_x.append(vis_duration_ms)
     planned_base.append(planned_start)
-    delayed_x.append(timedelta(days=vis_duration))
+    delayed_x.append(vis_duration_ms)
     delayed_base.append(shifted_start)
 
     # Date-range label + delay callout, placed just to the right of the delayed bar
