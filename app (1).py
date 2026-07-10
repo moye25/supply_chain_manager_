@@ -1,0 +1,522 @@
+"""
+================================================================================
+AUTONOMOUS SUPPLY CHAIN MANAGER — Kaya AI India Hackathon 2026 (Track 2)
+Smart Command Center — Streamlit + CrewAI single-file prototype (v2 UI)
+================================================================================
+
+WHAT THIS DOES
+---------------
+A proactive Multi-Agent AI system for construction supply chains:
+
+  1. Procurement Agent  -> reads an unstructured vendor email, extracts the
+                            delayed material, delay length, and root cause.
+  2. Scheduling Agent    -> cross-references the delay against the project
+                            schedule to find every downstream task/crew/
+                            equipment rental that is now at risk.
+  3. Financial Agent     -> compares the cost of idle labor/equipment vs. the
+                            cost of rescheduling, and issues a recommendation.
+
+v2 adds: a wide "Smart Command Center" layout, a full-width inbox card (no
+more squeezed sidebar email), KPI stat cards, and a Gantt-style timeline chart
+that visually shows the planned vs. delayed schedule and every task at risk.
+
+--------------------------------------------------------------------------------
+PIP INSTALL
+--------------------------------------------------------------------------------
+    pip install streamlit crewai crewai-tools plotly
+
+--------------------------------------------------------------------------------
+SET YOUR LLM API KEY
+--------------------------------------------------------------------------------
+Replace the placeholder below, set an OPENAI_API_KEY env var, or (recommended
+for Streamlit Community Cloud) add it under App settings > Secrets:
+    OPENAI_API_KEY = "sk-..."
+
+--------------------------------------------------------------------------------
+RUN
+--------------------------------------------------------------------------------
+    streamlit run app.py
+
+================================================================================
+"""
+
+import os
+import time
+from datetime import datetime, timedelta
+
+import streamlit as st
+import plotly.graph_objects as go
+from crewai import Agent, Task, Crew, Process, LLM
+
+# ==============================================================================
+# 0. LLM CONFIG — PLACEHOLDER API KEY
+# ==============================================================================
+# Key lookup order (first match wins):
+#   1. Streamlit Cloud "Secrets" (Advanced settings > Secrets on deploy)
+#   2. A real OPENAI_API_KEY environment variable (local/dev use)
+#   3. Placeholder -> triggers MOCK MODE automatically (fully working scripted
+#      demo, no API key needed — safe fallback for live judging)
+_key_from_secrets = ""
+try:
+    _key_from_secrets = st.secrets.get("OPENAI_API_KEY", "")
+except Exception:
+    _key_from_secrets = ""
+
+os.environ.setdefault("OPENAI_API_KEY", "YOUR_API_KEY_HERE")
+if _key_from_secrets:
+    os.environ["OPENAI_API_KEY"] = _key_from_secrets
+
+MOCK_MODE = os.environ.get("OPENAI_API_KEY", "") in ("", "YOUR_API_KEY_HERE")
+llm = LLM(model="gpt-4o-mini", temperature=0.2) if not MOCK_MODE else None
+
+# ==============================================================================
+# 1. HARDCODED MOCK DATA
+# ==============================================================================
+
+VENDOR_EMAIL = {
+    "from": "dispatch@apexsteelsupply.com",
+    "to": "procurement@skylineconstruction.com",
+    "subject": "URGENT — Shipment Delay Notice — PO#48291 (Structural Steel Beams)",
+    "received": "Today, 08:14 AM",
+    "body": (
+        "Hi Team,\n\n"
+        "We regret to inform you that your order of structural steel I-beams "
+        "(PO#48291, 42 tons, Grade A992) is experiencing a delay due to severe "
+        "congestion at the Port of Mundra. Customs clearance backlog and a "
+        "berth shortage have pushed our estimated arrival from July 14 to "
+        "July 18 — a 4-day delay. We are actively expediting where possible "
+        "but cannot guarantee an earlier release at this time. We will notify "
+        "you the moment the shipment clears customs.\n\n"
+        "Apologies for the inconvenience.\n\n"
+        "Regards,\nApex Steel Supply — Logistics Desk"
+    ),
+}
+
+DELAY_DAYS = 4
+TODAY = datetime(2026, 7, 11)
+
+# Task -> (planned_start_offset_days, duration_days, type, daily_idle_cost)
+SCHEDULE = {
+    "Steel Delivery (PO#48291)": {"start": 3, "duration": 1, "type": "delivery", "daily_cost": 0},
+    "Crane Rental — Tower Crane TC-88": {"start": 4, "duration": 5, "type": "equipment", "daily_cost": 2400},
+    "Framing Crew (12 workers)": {"start": 4, "duration": 6, "type": "labor", "daily_cost": 3600},
+    "Structural Inspection": {"start": 10, "duration": 1, "type": "milestone", "daily_cost": 0},
+}
+
+RESCHEDULE_COST = 1800  # one-time cost to re-sequence crane + crew elsewhere
+
+# ==============================================================================
+# 2. CREWAI AGENTS
+# ==============================================================================
+
+def build_agents():
+    procurement_agent = Agent(
+        role="Procurement Intelligence Agent",
+        goal="Extract material, PO, delay length, ETA change, and root cause from vendor emails.",
+        backstory="A former logistics coordinator turned AI agent, obsessive about catching supplier delays early.",
+        llm=llm, verbose=True, allow_delegation=False,
+    )
+    scheduling_agent = Agent(
+        role="Schedule Impact Agent",
+        goal="Cross-reference a delay against the project schedule and identify every task at risk.",
+        backstory="A veteran site scheduler who has seen every cascading delay a site can produce.",
+        llm=llm, verbose=True, allow_delegation=False,
+    )
+    financial_agent = Agent(
+        role="Financial Recommendation Agent",
+        goal="Compare idle cost vs. reschedule cost and issue one clear numeric recommendation.",
+        backstory="A cost controller who has saved projects six figures by catching idle-time bleed early.",
+        llm=llm, verbose=True, allow_delegation=False,
+    )
+    return procurement_agent, scheduling_agent, financial_agent
+
+
+def run_live_crew(email_body, schedule):
+    procurement_agent, scheduling_agent, financial_agent = build_agents()
+
+    t1 = Task(
+        description=f"Read this vendor email and extract Material, PO Number, Delay (days), Original ETA, New ETA, Root Cause:\n\n{email_body}",
+        expected_output="Structured summary with Material, PO Number, Delay, Original ETA, New ETA, Root Cause.",
+        agent=procurement_agent,
+    )
+    c1 = Crew(agents=[procurement_agent], tasks=[t1], process=Process.sequential, verbose=True)
+    proc_out = str(c1.kickoff())
+
+    t2 = Task(
+        description=f"Delay info: {proc_out}\n\nProject schedule: {schedule}\n\nList every affected task with idle days and idle cost per day.",
+        expected_output="List of affected tasks with idle cost.",
+        agent=scheduling_agent,
+    )
+    c2 = Crew(agents=[scheduling_agent], tasks=[t2], process=Process.sequential, verbose=True)
+    sched_out = str(c2.kickoff())
+
+    t3 = Task(
+        description=f"Schedule impact: {sched_out}\n\nOne-time reschedule cost: ${RESCHEDULE_COST}. Recommend reschedule or absorb idle cost, with dollars saved.",
+        expected_output="Final recommendation with dollar savings.",
+        agent=financial_agent,
+    )
+    c3 = Crew(agents=[financial_agent], tasks=[t3], process=Process.sequential, verbose=True)
+    fin_out = str(c3.kickoff())
+
+    return proc_out, sched_out, fin_out
+
+
+# ==============================================================================
+# 3. MOCK-MODE FALLBACK (used automatically when no real API key is set)
+# ==============================================================================
+
+def mock_procurement_output():
+    return (
+        "**Material:** Structural Steel I-Beams (Grade A992)  \n"
+        "**PO Number:** #48291  \n"
+        "**Delay:** 4 days  \n"
+        "**Original ETA:** 2026-07-14  \n"
+        "**New ETA:** 2026-07-18  \n"
+        "**Root Cause:** Port congestion at Port of Mundra — customs clearance backlog and berth shortage."
+    )
+
+
+def mock_scheduling_output():
+    return (
+        "**Crane Rental — Tower Crane TC-88**\n"
+        "- Planned start blocked until steel arrives.\n"
+        "- Idle exposure: 4 days × $2,400/day = **$9,600**\n\n"
+        "**Framing Crew (12 workers)**\n"
+        "- Planned start blocked until steel arrives.\n"
+        "- Idle exposure: 4 days × $3,600/day = **$14,400**\n\n"
+        "**Downstream Milestone:** Structural Inspection pushed back 4 days."
+    )
+
+
+def mock_financial_output(idle_cost, savings):
+    return (
+        f"**Idle cost if no action taken:** ${idle_cost:,}  \n"
+        f"**Cost to reschedule crane + framing crew for 4 days:** ${RESCHEDULE_COST:,}\n\n"
+        f"### ✅ Recommendation: RESCHEDULE\n"
+        f"Move Tower Crane TC-88 and the 12-person framing crew to the Riverside "
+        f"Block B site for 4 days rather than let them sit idle. This saves an "
+        f"estimated **${savings:,}**."
+    )
+
+
+# ==============================================================================
+# 4. STREAMLIT PAGE CONFIG + STYLE
+# ==============================================================================
+
+st.set_page_config(
+    page_title="Smart Command Center | Autonomous Supply Chain Manager",
+    page_icon="🏗️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---- Design tokens: blueprint-industrial palette ----
+NAVY = "#0B1524"
+STEEL = "#1B3A6B"
+STEEL_LIGHT = "#3A5075"
+ORANGE = "#E8871E"
+CONCRETE = "#F2F3F5"
+CARD = "#FFFFFF"
+INK = "#151B26"
+MUTED = "#6B7280"
+ALERT = "#C0392B"
+SUCCESS = "#1E7A46"
+GRID_LINE = "#22406E"
+
+st.markdown(f"""
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+html, body, [class*="css"] {{ font-family: 'Inter', sans-serif; }}
+h1, h2, h3 {{ font-family: 'Space Grotesk', sans-serif !important; }}
+.stApp {{ background-color: {CONCRETE}; }}
+
+/* Header banner with blueprint grid texture */
+.command-header {{
+    background-color: {NAVY};
+    background-image:
+        linear-gradient(rgba(58,80,117,0.35) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(58,80,117,0.35) 1px, transparent 1px);
+    background-size: 26px 26px;
+    border-radius: 10px;
+    padding: 26px 30px;
+    margin-bottom: 22px;
+    border-left: 5px solid {ORANGE};
+}}
+.command-header .eyebrow {{
+    color: {ORANGE}; font-family: 'IBM Plex Mono', monospace; font-size: 12.5px;
+    letter-spacing: 1.5px; font-weight: 500; margin-bottom: 6px;
+}}
+.command-header h1 {{
+    color: #FFFFFF !important; font-size: 30px; margin: 0 0 6px 0; font-weight: 700;
+}}
+.command-header p {{ color: #C7D0E8; margin: 0; font-size: 14.5px; }}
+.status-pill {{
+    display: inline-block; background: rgba(30,122,70,0.18); color: #58D68D;
+    border: 1px solid rgba(88,214,141,0.4); border-radius: 20px;
+    padding: 4px 12px; font-family: 'IBM Plex Mono', monospace; font-size: 11.5px;
+    margin-top: 10px;
+}}
+
+/* KPI cards */
+.kpi-card {{
+    background: {CARD}; border-radius: 10px; padding: 16px 18px;
+    border: 1px solid #E3E6ED; border-top: 3px solid {STEEL};
+}}
+.kpi-card.risk {{ border-top-color: {ALERT}; }}
+.kpi-card.save {{ border-top-color: {SUCCESS}; }}
+.kpi-label {{
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: {MUTED};
+    letter-spacing: 0.8px; text-transform: uppercase; margin-bottom: 4px;
+}}
+.kpi-value {{ font-family: 'Space Grotesk', sans-serif; font-size: 26px; font-weight: 700; color: {INK}; }}
+
+/* Inbox card */
+.inbox-card {{
+    background: {CARD}; border-radius: 10px; border: 1px solid #E3E6ED;
+    overflow: hidden; margin-bottom: 4px;
+}}
+.inbox-meta {{
+    background: {CONCRETE}; padding: 14px 20px; border-bottom: 1px solid #E3E6ED;
+    font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: {MUTED};
+    line-height: 1.9;
+}}
+.inbox-subject {{
+    font-family: 'Space Grotesk', sans-serif; font-size: 17px; font-weight: 700;
+    color: {ALERT}; padding: 14px 20px 0 20px;
+}}
+.inbox-body {{
+    padding: 10px 20px 20px 20px; color: {INK}; font-size: 14.5px; line-height: 1.7;
+    white-space: pre-line;
+}}
+
+/* Section label */
+.section-label {{
+    font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: {STEEL};
+    letter-spacing: 1.2px; text-transform: uppercase; font-weight: 500;
+    margin: 26px 0 8px 0; display: flex; align-items: center; gap: 8px;
+}}
+.section-label::after {{ content: ""; flex: 1; height: 1px; background: #D6DAE3; }}
+
+/* Agent cards */
+.agent-card {{
+    background: {CARD}; border-radius: 10px; border: 1px solid #E3E6ED;
+    border-left: 4px solid {STEEL_LIGHT}; padding: 14px 18px; margin-bottom: 12px;
+}}
+.agent-card.fin {{ border-left-color: {ORANGE}; }}
+.agent-name {{
+    font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 14.5px;
+    color: {STEEL}; margin-bottom: 6px;
+}}
+.agent-card.fin .agent-name {{ color: {ORANGE}; }}
+
+/* Final recommendation banner */
+.rec-banner {{
+    background: linear-gradient(135deg, {NAVY} 0%, {STEEL} 100%);
+    border-radius: 12px; padding: 24px 28px; border-left: 6px solid {ORANGE};
+    color: white; margin-top: 10px;
+}}
+.rec-banner h4 {{ color: #FFFFFF !important; margin-top: 0; }}
+.rec-banner p, .rec-banner li {{ color: #E4E9F5; }}
+.rec-banner strong {{ color: {ORANGE}; }}
+</style>
+""", unsafe_allow_html=True)
+
+# ==============================================================================
+# 5. SESSION STATE
+# ==============================================================================
+
+for key, default in [("processed", False), ("approved", False), ("proc_out", ""),
+                      ("sched_out", ""), ("fin_out", ""), ("idle_cost", 0), ("savings", 0)]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ==============================================================================
+# 6. HEADER
+# ==============================================================================
+
+st.markdown(f"""
+<div class="command-header">
+    <div class="eyebrow">KAYA AI INDIA HACKATHON 2026 · TRACK 2 · SUPPLY CHAIN</div>
+    <h1>🏗️ Smart Command Center</h1>
+    <p>Autonomous Supply Chain Manager — Procurement → Scheduling → Financial agents monitoring your site in real time.</p>
+    <div class="status-pill">● {"MOCK MODE — SCRIPTED DEMO" if MOCK_MODE else "LIVE MODE — CONNECTED"}</div>
+</div>
+""", unsafe_allow_html=True)
+
+# ==============================================================================
+# 7. SIDEBAR — CONTROL PANEL
+# ==============================================================================
+
+with st.sidebar:
+    st.markdown("### 📥 Control Panel")
+    st.caption("Simulated inbox: **1 new vendor email**")
+    process_clicked = st.button("🚨 Process Incoming Vendor Emails", type="primary", use_container_width=True)
+
+    st.divider()
+    st.markdown("### 📅 Active Project Tasks")
+    for task, d in SCHEDULE.items():
+        icon = {"delivery": "🚚", "equipment": "🏗️", "labor": "👷", "milestone": "🏁"}[d["type"]]
+        planned_date = (TODAY + timedelta(days=d["start"])).strftime("%b %d")
+        st.caption(f"{icon} **{task}**  \nStart: {planned_date}")
+
+    st.divider()
+    if MOCK_MODE:
+        st.info("No live API key detected — running scripted mock mode so the full demo works for judges regardless.", icon="ℹ️")
+
+# ==============================================================================
+# 8. KPI ROW
+# ==============================================================================
+
+k1, k2, k3, k4 = st.columns(4)
+tasks_at_risk = sum(1 for d in SCHEDULE.values() if d["type"] in ("equipment", "labor"))
+with k1:
+    st.markdown(f'<div class="kpi-card"><div class="kpi-label">Delay Detected</div><div class="kpi-value">{DELAY_DAYS} days</div></div>', unsafe_allow_html=True)
+with k2:
+    st.markdown(f'<div class="kpi-card risk"><div class="kpi-label">Tasks At Risk</div><div class="kpi-value">{tasks_at_risk}</div></div>', unsafe_allow_html=True)
+with k3:
+    idle_preview = DELAY_DAYS * sum(d["daily_cost"] for d in SCHEDULE.values())
+    st.markdown(f'<div class="kpi-card risk"><div class="kpi-label">Idle Cost Exposure</div><div class="kpi-value">${idle_preview:,}</div></div>', unsafe_allow_html=True)
+with k4:
+    savings_preview = idle_preview - RESCHEDULE_COST
+    st.markdown(f'<div class="kpi-card save"><div class="kpi-label">Potential Savings</div><div class="kpi-value">${savings_preview:,}</div></div>', unsafe_allow_html=True)
+
+# ==============================================================================
+# 9. INBOX CARD (full width, not squeezed)
+# ==============================================================================
+
+st.markdown('<div class="section-label">📧 Incoming Vendor Communication</div>', unsafe_allow_html=True)
+st.markdown(f"""
+<div class="inbox-card">
+    <div class="inbox-meta">
+        FROM&nbsp;&nbsp;{VENDOR_EMAIL['from']}<br>
+        TO&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{VENDOR_EMAIL['to']}<br>
+        RECEIVED&nbsp;&nbsp;{VENDOR_EMAIL['received']}
+    </div>
+    <div class="inbox-subject">⚠️ {VENDOR_EMAIL['subject']}</div>
+    <div class="inbox-body">{VENDOR_EMAIL['body']}</div>
+</div>
+""", unsafe_allow_html=True)
+
+# ==============================================================================
+# 10. GANTT-STYLE SCHEDULE IMPACT CHART
+# ==============================================================================
+
+st.markdown('<div class="section-label">📅 Schedule Impact — Planned vs. Delayed</div>', unsafe_allow_html=True)
+
+fig = go.Figure()
+tasks = list(SCHEDULE.keys())
+colors_map = {"delivery": STEEL_LIGHT, "equipment": ORANGE, "labor": ORANGE, "milestone": MUTED}
+
+for i, task in enumerate(tasks):
+    d = SCHEDULE[task]
+    planned_start = TODAY + timedelta(days=d["start"])
+    planned_end = planned_start + timedelta(days=d["duration"])
+    shifted_start = planned_start + timedelta(days=DELAY_DAYS) if d["daily_cost"] > 0 or d["type"] == "delivery" else planned_start + timedelta(days=DELAY_DAYS)
+    shifted_end = shifted_start + timedelta(days=d["duration"])
+
+    # Planned bar (ghost/outline)
+    fig.add_trace(go.Bar(
+        x=[(planned_end - planned_start).days], y=[task], base=[planned_start],
+        orientation="h", marker=dict(color="rgba(58,80,117,0.18)", line=dict(color=STEEL_LIGHT, width=1.5)),
+        name="Originally Planned", legendgroup="planned", showlegend=(i == 0),
+        hovertemplate=f"<b>{task}</b><br>Planned: %{{base|%b %d}} → " + planned_end.strftime("%b %d") + "<extra></extra>",
+        width=0.42, offset=-0.42,
+    ))
+    # Delayed / actual bar
+    fig.add_trace(go.Bar(
+        x=[(shifted_end - shifted_start).days], y=[task], base=[shifted_start],
+        orientation="h", marker=dict(color=colors_map[d["type"]]),
+        name="Delayed / At Risk", legendgroup="delayed", showlegend=(i == 0),
+        hovertemplate=f"<b>{task}</b><br>New: %{{base|%b %d}} → " + shifted_end.strftime("%b %d") + f"<br>Idle cost/day: ${d['daily_cost']:,}<extra></extra>",
+        width=0.42, offset=0,
+    ))
+
+fig.add_vline(x=TODAY.timestamp() * 1000, line_dash="dot", line_color=ALERT, annotation_text="Today", annotation_font_color=ALERT)
+
+fig.update_layout(
+    barmode="overlay", height=320, plot_bgcolor="white", paper_bgcolor="white",
+    margin=dict(l=10, r=10, t=10, b=10),
+    xaxis=dict(type="date", gridcolor="#E9ECF2", tickfont=dict(family="IBM Plex Mono", size=11)),
+    yaxis=dict(autorange="reversed", tickfont=dict(family="Inter", size=12.5)),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=11.5)),
+    font=dict(family="Inter"),
+)
+st.plotly_chart(fig, use_container_width=True)
+st.caption("Steel-colored bars = originally planned schedule. Orange bars = actual delayed schedule the agents detected. Dotted red line = today.")
+
+# ==============================================================================
+# 11. AGENT ACTIVITY FEED
+# ==============================================================================
+
+st.markdown('<div class="section-label">🧠 Agent Activity Feed</div>', unsafe_allow_html=True)
+feed = st.container()
+
+if process_clicked:
+    st.session_state.approved = False
+    idle_cost = DELAY_DAYS * sum(d["daily_cost"] for d in SCHEDULE.values())
+    savings = idle_cost - RESCHEDULE_COST
+
+    if not MOCK_MODE:
+        with st.spinner("Agents are analyzing the delay..."):
+            proc_out, sched_out, fin_out = run_live_crew(VENDOR_EMAIL["body"], SCHEDULE)
+    else:
+        proc_out = mock_procurement_output()
+        sched_out = mock_scheduling_output()
+        fin_out = mock_financial_output(idle_cost, savings)
+
+    with feed:
+        with st.status("👷 Procurement Agent reading vendor email...", expanded=True) as s:
+            time.sleep(0.8)
+            st.markdown(f'<div class="agent-card"><div class="agent-name">PROCUREMENT AGENT</div>{proc_out}</div>', unsafe_allow_html=True)
+            s.update(label="✅ Procurement Agent: delay extracted", state="complete")
+
+        with st.status("📅 Scheduling Agent cross-referencing project timeline...", expanded=True) as s:
+            time.sleep(0.9)
+            st.markdown(f'<div class="agent-card"><div class="agent-name">SCHEDULING AGENT</div>{sched_out}</div>', unsafe_allow_html=True)
+            s.update(label="✅ Scheduling Agent: downstream impact mapped", state="complete")
+
+        with st.status("💰 Financial Agent calculating cost tradeoffs...", expanded=True) as s:
+            time.sleep(0.9)
+            st.markdown(f'<div class="agent-card fin"><div class="agent-name">FINANCIAL AGENT</div>{fin_out}</div>', unsafe_allow_html=True)
+            s.update(label="✅ Financial Agent: recommendation ready", state="complete")
+
+    st.session_state.processed = True
+    st.session_state.proc_out = proc_out
+    st.session_state.sched_out = sched_out
+    st.session_state.fin_out = fin_out
+    st.session_state.idle_cost = idle_cost
+    st.session_state.savings = savings
+
+elif st.session_state.processed:
+    with feed:
+        st.markdown(f'<div class="agent-card"><div class="agent-name">PROCUREMENT AGENT</div>{st.session_state.proc_out}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="agent-card"><div class="agent-name">SCHEDULING AGENT</div>{st.session_state.sched_out}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="agent-card fin"><div class="agent-name">FINANCIAL AGENT</div>{st.session_state.fin_out}</div>', unsafe_allow_html=True)
+else:
+    with feed:
+        st.info("Click **Process Incoming Vendor Emails** in the sidebar to run the Procurement → Scheduling → Financial pipeline.")
+
+# ==============================================================================
+# 12. FINAL RECOMMENDATION BANNER
+# ==============================================================================
+
+if st.session_state.processed:
+    st.markdown('<div class="section-label">🚦 Final Recommendation</div>', unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class="rec-banner">
+        <h4>⚠️ Action Required — {DELAY_DAYS}-Day Steel Delay Detected</h4>
+        {st.session_state.fin_out}
+    </div>
+    """, unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([1, 1, 4])
+    with col1:
+        if st.button("✅ Approve", type="primary", disabled=st.session_state.approved, use_container_width=True):
+            st.session_state.approved = True
+    with col2:
+        if st.button("❌ Dismiss", disabled=st.session_state.approved, use_container_width=True):
+            st.session_state.processed = False
+            st.rerun()
+
+    if st.session_state.approved:
+        st.success(f"Recommendation approved. Crane + framing crew reassignment queued. Estimated savings locked in: **${st.session_state.savings:,}**", icon="✅")
