@@ -155,6 +155,42 @@ def build_agents():
     return procurement_agent, scheduling_agent, financial_agent
 
 
+class AgentPipelineError(Exception):
+    """Raised when a crew.kickoff() call ultimately fails, with a judge/user-friendly message."""
+    pass
+
+
+def _kickoff_with_retry(crew, step_name, max_retries=2, base_delay=3):
+    """
+    Run crew.kickoff() with a couple of short retries on transient rate-limit
+    errors (common on free-tier / low-RPM keys when 3 agents fire back-to-back
+    LLM calls). If it still fails after retries, raise a clean, readable error
+    instead of letting the raw traceback crash the whole page.
+    """
+    last_err = None
+    for attempt in range(max_retries + 1):
+        try:
+            return str(crew.kickoff())
+        except Exception as e:
+            last_err = e
+            err_text = str(e).lower()
+            is_rate_limit = "ratelimit" in err_text.replace("_", "") or "429" in err_text
+            is_quota = "quota" in err_text or "insufficient_quota" in err_text
+            if (is_rate_limit or is_quota) and attempt < max_retries:
+                time.sleep(base_delay * (attempt + 1))  # simple backoff: 3s, 6s...
+                continue
+            break
+
+    err_text = str(last_err).lower()
+    if "quota" in err_text or "insufficient_quota" in err_text:
+        reason = "Your OpenAI account has run out of quota/credits."
+    elif "ratelimit" in err_text.replace("_", "") or "429" in err_text:
+        reason = "Your OpenAI API key is being rate-limited (too many requests for its tier)."
+    else:
+        reason = f"The {step_name} agent's API call failed unexpectedly ({type(last_err).__name__})."
+    raise AgentPipelineError(f"{reason} Falling back to scripted demo output so the run can still complete.")
+
+
 def run_live_crew(email_body, schedule):
     procurement_agent, scheduling_agent, financial_agent = build_agents()
 
@@ -164,7 +200,7 @@ def run_live_crew(email_body, schedule):
         agent=procurement_agent,
     )
     c1 = Crew(agents=[procurement_agent], tasks=[t1], process=Process.sequential, verbose=True)
-    proc_out = str(c1.kickoff())
+    proc_out = _kickoff_with_retry(c1, "Procurement")
 
     t2 = Task(
         description=f"Delay info: {proc_out}\n\nProject schedule: {schedule}\n\nList every affected task with idle days and idle cost per day.",
@@ -172,7 +208,7 @@ def run_live_crew(email_body, schedule):
         agent=scheduling_agent,
     )
     c2 = Crew(agents=[scheduling_agent], tasks=[t2], process=Process.sequential, verbose=True)
-    sched_out = str(c2.kickoff())
+    sched_out = _kickoff_with_retry(c2, "Scheduling")
 
     t3 = Task(
         description=f"Schedule impact: {sched_out}\n\nOne-time reschedule cost: ${RESCHEDULE_COST}. Recommend reschedule or absorb idle cost, with dollars saved.",
@@ -180,7 +216,7 @@ def run_live_crew(email_body, schedule):
         agent=financial_agent,
     )
     c3 = Crew(agents=[financial_agent], tasks=[t3], process=Process.sequential, verbose=True)
-    fin_out = str(c3.kickoff())
+    fin_out = _kickoff_with_retry(c3, "Financial")
 
     return proc_out, sched_out, fin_out
 
@@ -381,8 +417,9 @@ st.html(f"""
 
 with st.sidebar:
     st.markdown("### 📥 Control Panel")
-    st.caption("Simulated inbox: **1 new vendor email**")
+    st.caption("Simulated inbox: **1 new vendor email (unread by agents)**")
     process_clicked = st.button("🚨 Process Incoming Vendor Emails", type="primary", use_container_width=True)
+    st.caption("👆 The email below is just a preview — nothing has been analyzed yet. Click this to run it through the Procurement → Scheduling → Financial agent pipeline.")
 
     st.divider()
     st.markdown("### 📅 Active Project Tasks")
@@ -417,6 +454,13 @@ with k4:
 # ==============================================================================
 
 st.html('<div class="section-label">📧 Incoming Vendor Communication</div>')
+_badge = (
+    '<span style="background:#1E7A46;color:white;border-radius:20px;padding:3px 12px;'
+    'font-family:\'IBM Plex Mono\',monospace;font-size:11px;margin-left:10px;">✅ PROCESSED BY AGENTS</span>'
+    if st.session_state.processed else
+    '<span style="background:#C0392B;color:white;border-radius:20px;padding:3px 12px;'
+    'font-family:\'IBM Plex Mono\',monospace;font-size:11px;margin-left:10px;">🆕 AWAITING ANALYSIS</span>'
+)
 st.html(f"""
 <div class="inbox-card">
     <div class="inbox-meta">
@@ -424,7 +468,7 @@ st.html(f"""
         TO&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{VENDOR_EMAIL['to']}<br>
         RECEIVED&nbsp;&nbsp;{VENDOR_EMAIL['received']}
     </div>
-    <div class="inbox-subject">⚠️ {VENDOR_EMAIL['subject']}</div>
+    <div class="inbox-subject">⚠️ {VENDOR_EMAIL['subject']}{_badge}</div>
     <div class="inbox-body">{VENDOR_EMAIL['body']}</div>
 </div>
 """)
@@ -438,43 +482,61 @@ st.html('<div class="section-label">📅 Schedule Impact — Planned vs. Delayed
 fig = go.Figure()
 tasks = list(SCHEDULE.keys())
 colors_map = {"delivery": STEEL_LIGHT, "equipment": ORANGE, "labor": ORANGE, "milestone": MUTED}
+MIN_BAR_DAYS = 1.4  # visual floor so 1-day tasks still render as a readable bar, not an invisible sliver
 
-for i, task in enumerate(tasks):
+planned_x, planned_base, delayed_x, delayed_base = [], [], [], []
+for task in tasks:
     d = SCHEDULE[task]
     planned_start = TODAY + timedelta(days=d["start"])
     planned_end = planned_start + timedelta(days=d["duration"])
-    shifted_start = planned_start + timedelta(days=DELAY_DAYS) if d["daily_cost"] > 0 or d["type"] == "delivery" else planned_start + timedelta(days=DELAY_DAYS)
+    shifted_start = planned_start + timedelta(days=DELAY_DAYS)
     shifted_end = shifted_start + timedelta(days=d["duration"])
 
-    # Planned bar (ghost/outline)
-    fig.add_trace(go.Bar(
-        x=[(planned_end - planned_start).days], y=[task], base=[planned_start],
-        orientation="h", marker=dict(color="rgba(58,80,117,0.18)", line=dict(color=STEEL_LIGHT, width=1.5)),
-        name="Originally Planned", legendgroup="planned", showlegend=(i == 0),
-        hovertemplate=f"<b>{task}</b><br>Planned: %{{base|%b %d}} → " + planned_end.strftime("%b %d") + "<extra></extra>",
-        width=0.42, offset=-0.42,
-    ))
-    # Delayed / actual bar
-    fig.add_trace(go.Bar(
-        x=[(shifted_end - shifted_start).days], y=[task], base=[shifted_start],
-        orientation="h", marker=dict(color=colors_map[d["type"]]),
-        name="Delayed / At Risk", legendgroup="delayed", showlegend=(i == 0),
-        hovertemplate=f"<b>{task}</b><br>New: %{{base|%b %d}} → " + shifted_end.strftime("%b %d") + f"<br>Idle cost/day: ${d['daily_cost']:,}<extra></extra>",
-        width=0.42, offset=0,
-    ))
+    vis_duration = max(d["duration"], MIN_BAR_DAYS)
+    planned_x.append(vis_duration)
+    planned_base.append(planned_start)
+    delayed_x.append(vis_duration)
+    delayed_base.append(shifted_start)
 
-fig.add_vline(x=TODAY.timestamp() * 1000, line_dash="dot", line_color=ALERT, annotation_text="Today", annotation_font_color=ALERT)
+    # Date-range label + delay callout, placed just to the right of the delayed bar
+    fig.add_annotation(
+        x=shifted_start + timedelta(days=vis_duration + 0.15), y=task,
+        text=f"{planned_start.strftime('%b %d')} → {shifted_start.strftime('%b %d')}  "
+             f"<span style='color:{ALERT}'><b>(+{DELAY_DAYS}d)</b></span>",
+        showarrow=False, xanchor="left", font=dict(family="IBM Plex Mono", size=11, color=INK),
+        align="left",
+    )
+
+fig.add_trace(go.Bar(
+    x=planned_x, y=tasks, base=planned_base, orientation="h",
+    marker=dict(color="#D8DEE9", line=dict(color=STEEL_LIGHT, width=1.5)),
+    name="Originally Planned",
+    hovertemplate="<b>%{y}</b><br>Originally planned: %{base|%b %d}<extra></extra>",
+))
+fig.add_trace(go.Bar(
+    x=delayed_x, y=tasks, base=delayed_base, orientation="h",
+    marker=dict(color=[colors_map[SCHEDULE[t]["type"]] for t in tasks]),
+    name="Delayed / At Risk",
+    hovertemplate="<b>%{y}</b><br>New date: %{base|%b %d}<extra></extra>",
+))
+
+fig.add_vline(x=TODAY.timestamp() * 1000, line_dash="dot", line_width=2, line_color=ALERT,
+              annotation_text="Today", annotation_font_color=ALERT, annotation_font_size=12)
 
 fig.update_layout(
-    barmode="overlay", height=320, plot_bgcolor="white", paper_bgcolor="white",
-    margin=dict(l=10, r=10, t=10, b=10),
+    barmode="group", bargap=0.35, bargroupgap=0.08,
+    height=340, plot_bgcolor="white", paper_bgcolor="white",
+    margin=dict(l=10, r=170, t=10, b=10),  # right margin makes room for the date-range labels
     xaxis=dict(type="date", gridcolor="#E9ECF2", tickfont=dict(family="IBM Plex Mono", size=11)),
     yaxis=dict(autorange="reversed", tickfont=dict(family="Inter", size=12.5)),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=11.5)),
     font=dict(family="Inter"),
 )
 st.plotly_chart(fig, use_container_width=True)
-st.caption("Steel-colored bars = originally planned schedule. Orange bars = actual delayed schedule the agents detected. Dotted red line = today.")
+st.caption(
+    "Gray bars = originally planned schedule. Orange/steel bars = the delayed schedule the agents detected. "
+    "The label at the end of each row shows the exact date shift. Dotted red line = today."
+)
 
 # ==============================================================================
 # 11. AGENT ACTIVITY FEED
@@ -488,13 +550,23 @@ if process_clicked:
     idle_cost = DELAY_DAYS * sum(d["daily_cost"] for d in SCHEDULE.values())
     savings = idle_cost - RESCHEDULE_COST
 
+    pipeline_error = None
     if not MOCK_MODE:
-        with st.spinner("Agents are analyzing the delay..."):
-            proc_out, sched_out, fin_out = run_live_crew(VENDOR_EMAIL["body"], SCHEDULE)
+        try:
+            with st.spinner("Agents are analyzing the delay..."):
+                proc_out, sched_out, fin_out = run_live_crew(VENDOR_EMAIL["body"], SCHEDULE)
+        except AgentPipelineError as e:
+            pipeline_error = str(e)
+            proc_out = mock_procurement_output()
+            sched_out = mock_scheduling_output()
+            fin_out = mock_financial_output(idle_cost, savings)
     else:
         proc_out = mock_procurement_output()
         sched_out = mock_scheduling_output()
         fin_out = mock_financial_output(idle_cost, savings)
+
+    if pipeline_error:
+        st.warning(f"⚠️ Live agent call didn't complete: {pipeline_error}", icon="⚠️")
 
     with feed:
         with st.status("👷 Procurement Agent reading vendor email...", expanded=True) as s:
