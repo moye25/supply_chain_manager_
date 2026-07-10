@@ -493,9 +493,9 @@ for task in tasks:
     shifted_end = shifted_start + timedelta(days=d["duration"])
 
     vis_duration = max(d["duration"], MIN_BAR_DAYS)
-    planned_x.append(vis_duration)
+    planned_x.append(timedelta(days=vis_duration))
     planned_base.append(planned_start)
-    delayed_x.append(vis_duration)
+    delayed_x.append(timedelta(days=vis_duration))
     delayed_base.append(shifted_start)
 
     # Date-range label + delay callout, placed just to the right of the delayed bar
@@ -526,9 +526,9 @@ fig.add_vline(x=TODAY.timestamp() * 1000, line_dash="dot", line_width=2, line_co
 fig.update_layout(
     barmode="group", bargap=0.35, bargroupgap=0.08,
     height=340, plot_bgcolor="white", paper_bgcolor="white",
-    margin=dict(l=10, r=170, t=10, b=10),  # right margin makes room for the date-range labels
+    margin=dict(l=200, r=190, t=10, b=10),  # room for full task names on the left, date labels on the right
     xaxis=dict(type="date", gridcolor="#E9ECF2", tickfont=dict(family="IBM Plex Mono", size=11)),
-    yaxis=dict(autorange="reversed", tickfont=dict(family="Inter", size=12.5)),
+    yaxis=dict(autorange="reversed", tickfont=dict(family="Inter", size=12.5), automargin=True),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=11.5)),
     font=dict(family="Inter"),
 )
