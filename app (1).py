@@ -105,6 +105,30 @@ SCHEDULE = {
 
 RESCHEDULE_COST = 1800  # one-time cost to re-sequence crane + crew elsewhere
 
+
+def md_lite(text: str) -> str:
+    """
+    Convert a small, safe subset of markdown (used by our own agent output
+    strings only — never on raw user input) into HTML so it can be embedded
+    inside st.html() cards. Handles **bold**, "### " mini-headings, "- "
+    bullets, and line breaks. This avoids relying on Streamlit's markdown
+    parser for raw HTML blocks, which breaks on blank lines.
+    """
+    import re
+    text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+    out_lines = []
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if line.startswith("### "):
+            out_lines.append(f'<div class="mini-heading">{line[4:]}</div>')
+        elif line.startswith("- "):
+            out_lines.append(f'<div class="bullet-line">&bull;&nbsp;&nbsp;{line[2:]}</div>')
+        elif line == "":
+            out_lines.append('<div class="line-gap"></div>')
+        else:
+            out_lines.append(f"<div>{line}</div>")
+    return "".join(out_lines)
+
 # ==============================================================================
 # 2. CREWAI AGENTS
 # ==============================================================================
@@ -223,7 +247,7 @@ ALERT = "#C0392B"
 SUCCESS = "#1E7A46"
 GRID_LINE = "#22406E"
 
-st.markdown(f"""
+st.html(f"""
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 html, body, [class*="css"] {{ font-family: 'Inter', sans-serif; }}
@@ -318,8 +342,16 @@ h1, h2, h3 {{ font-family: 'Space Grotesk', sans-serif !important; }}
 .rec-banner h4 {{ color: #FFFFFF !important; margin-top: 0; }}
 .rec-banner p, .rec-banner li {{ color: #E4E9F5; }}
 .rec-banner strong {{ color: {ORANGE}; }}
+
+/* Lightweight markdown output (agent cards, rec banner) */
+.mini-heading {{
+    font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px;
+    margin: 10px 0 4px 0;
+}}
+.bullet-line {{ margin: 2px 0; }}
+.line-gap {{ height: 8px; }}
 </style>
-""", unsafe_allow_html=True)
+""")
 
 # ==============================================================================
 # 5. SESSION STATE
@@ -334,14 +366,14 @@ for key, default in [("processed", False), ("approved", False), ("proc_out", "")
 # 6. HEADER
 # ==============================================================================
 
-st.markdown(f"""
+st.html(f"""
 <div class="command-header">
     <div class="eyebrow">KAYA AI INDIA HACKATHON 2026 · TRACK 2 · SUPPLY CHAIN</div>
     <h1>🏗️ Smart Command Center</h1>
     <p>Autonomous Supply Chain Manager — Procurement → Scheduling → Financial agents monitoring your site in real time.</p>
     <div class="status-pill">● {"MOCK MODE — SCRIPTED DEMO" if MOCK_MODE else "LIVE MODE — CONNECTED"}</div>
 </div>
-""", unsafe_allow_html=True)
+""")
 
 # ==============================================================================
 # 7. SIDEBAR — CONTROL PANEL
@@ -370,22 +402,22 @@ with st.sidebar:
 k1, k2, k3, k4 = st.columns(4)
 tasks_at_risk = sum(1 for d in SCHEDULE.values() if d["type"] in ("equipment", "labor"))
 with k1:
-    st.markdown(f'<div class="kpi-card"><div class="kpi-label">Delay Detected</div><div class="kpi-value">{DELAY_DAYS} days</div></div>', unsafe_allow_html=True)
+    st.html(f'<div class="kpi-card"><div class="kpi-label">Delay Detected</div><div class="kpi-value">{DELAY_DAYS} days</div></div>')
 with k2:
-    st.markdown(f'<div class="kpi-card risk"><div class="kpi-label">Tasks At Risk</div><div class="kpi-value">{tasks_at_risk}</div></div>', unsafe_allow_html=True)
+    st.html(f'<div class="kpi-card risk"><div class="kpi-label">Tasks At Risk</div><div class="kpi-value">{tasks_at_risk}</div></div>')
 with k3:
     idle_preview = DELAY_DAYS * sum(d["daily_cost"] for d in SCHEDULE.values())
-    st.markdown(f'<div class="kpi-card risk"><div class="kpi-label">Idle Cost Exposure</div><div class="kpi-value">${idle_preview:,}</div></div>', unsafe_allow_html=True)
+    st.html(f'<div class="kpi-card risk"><div class="kpi-label">Idle Cost Exposure</div><div class="kpi-value">${idle_preview:,}</div></div>')
 with k4:
     savings_preview = idle_preview - RESCHEDULE_COST
-    st.markdown(f'<div class="kpi-card save"><div class="kpi-label">Potential Savings</div><div class="kpi-value">${savings_preview:,}</div></div>', unsafe_allow_html=True)
+    st.html(f'<div class="kpi-card save"><div class="kpi-label">Potential Savings</div><div class="kpi-value">${savings_preview:,}</div></div>')
 
 # ==============================================================================
 # 9. INBOX CARD (full width, not squeezed)
 # ==============================================================================
 
-st.markdown('<div class="section-label">📧 Incoming Vendor Communication</div>', unsafe_allow_html=True)
-st.markdown(f"""
+st.html('<div class="section-label">📧 Incoming Vendor Communication</div>')
+st.html(f"""
 <div class="inbox-card">
     <div class="inbox-meta">
         FROM&nbsp;&nbsp;{VENDOR_EMAIL['from']}<br>
@@ -395,13 +427,13 @@ st.markdown(f"""
     <div class="inbox-subject">⚠️ {VENDOR_EMAIL['subject']}</div>
     <div class="inbox-body">{VENDOR_EMAIL['body']}</div>
 </div>
-""", unsafe_allow_html=True)
+""")
 
 # ==============================================================================
 # 10. GANTT-STYLE SCHEDULE IMPACT CHART
 # ==============================================================================
 
-st.markdown('<div class="section-label">📅 Schedule Impact — Planned vs. Delayed</div>', unsafe_allow_html=True)
+st.html('<div class="section-label">📅 Schedule Impact — Planned vs. Delayed</div>')
 
 fig = go.Figure()
 tasks = list(SCHEDULE.keys())
@@ -448,7 +480,7 @@ st.caption("Steel-colored bars = originally planned schedule. Orange bars = actu
 # 11. AGENT ACTIVITY FEED
 # ==============================================================================
 
-st.markdown('<div class="section-label">🧠 Agent Activity Feed</div>', unsafe_allow_html=True)
+st.html('<div class="section-label">🧠 Agent Activity Feed</div>')
 feed = st.container()
 
 if process_clicked:
@@ -467,17 +499,17 @@ if process_clicked:
     with feed:
         with st.status("👷 Procurement Agent reading vendor email...", expanded=True) as s:
             time.sleep(0.8)
-            st.markdown(f'<div class="agent-card"><div class="agent-name">PROCUREMENT AGENT</div>{proc_out}</div>', unsafe_allow_html=True)
+            st.html(f'<div class="agent-card"><div class="agent-name">PROCUREMENT AGENT</div>{md_lite(proc_out)}</div>')
             s.update(label="✅ Procurement Agent: delay extracted", state="complete")
 
         with st.status("📅 Scheduling Agent cross-referencing project timeline...", expanded=True) as s:
             time.sleep(0.9)
-            st.markdown(f'<div class="agent-card"><div class="agent-name">SCHEDULING AGENT</div>{sched_out}</div>', unsafe_allow_html=True)
+            st.html(f'<div class="agent-card"><div class="agent-name">SCHEDULING AGENT</div>{md_lite(sched_out)}</div>')
             s.update(label="✅ Scheduling Agent: downstream impact mapped", state="complete")
 
         with st.status("💰 Financial Agent calculating cost tradeoffs...", expanded=True) as s:
             time.sleep(0.9)
-            st.markdown(f'<div class="agent-card fin"><div class="agent-name">FINANCIAL AGENT</div>{fin_out}</div>', unsafe_allow_html=True)
+            st.html(f'<div class="agent-card fin"><div class="agent-name">FINANCIAL AGENT</div>{md_lite(fin_out)}</div>')
             s.update(label="✅ Financial Agent: recommendation ready", state="complete")
 
     st.session_state.processed = True
@@ -489,9 +521,9 @@ if process_clicked:
 
 elif st.session_state.processed:
     with feed:
-        st.markdown(f'<div class="agent-card"><div class="agent-name">PROCUREMENT AGENT</div>{st.session_state.proc_out}</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="agent-card"><div class="agent-name">SCHEDULING AGENT</div>{st.session_state.sched_out}</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="agent-card fin"><div class="agent-name">FINANCIAL AGENT</div>{st.session_state.fin_out}</div>', unsafe_allow_html=True)
+        st.html(f'<div class="agent-card"><div class="agent-name">PROCUREMENT AGENT</div>{md_lite(st.session_state.proc_out)}</div>')
+        st.html(f'<div class="agent-card"><div class="agent-name">SCHEDULING AGENT</div>{md_lite(st.session_state.sched_out)}</div>')
+        st.html(f'<div class="agent-card fin"><div class="agent-name">FINANCIAL AGENT</div>{md_lite(st.session_state.fin_out)}</div>')
 else:
     with feed:
         st.info("Click **Process Incoming Vendor Emails** in the sidebar to run the Procurement → Scheduling → Financial pipeline.")
@@ -501,13 +533,13 @@ else:
 # ==============================================================================
 
 if st.session_state.processed:
-    st.markdown('<div class="section-label">🚦 Final Recommendation</div>', unsafe_allow_html=True)
-    st.markdown(f"""
+    st.html('<div class="section-label">🚦 Final Recommendation</div>')
+    st.html(f"""
     <div class="rec-banner">
         <h4>⚠️ Action Required — {DELAY_DAYS}-Day Steel Delay Detected</h4>
-        {st.session_state.fin_out}
+        {md_lite(st.session_state.fin_out)}
     </div>
-    """, unsafe_allow_html=True)
+    """)
 
     col1, col2, col3 = st.columns([1, 1, 4])
     with col1:
