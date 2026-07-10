@@ -532,7 +532,7 @@ fig.update_layout(
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=11.5)),
     font=dict(family="Inter"),
 )
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, use_container_width=True, theme=None)
 st.caption(
     "Gray bars = originally planned schedule. Orange/steel bars = the delayed schedule the agents detected. "
     "The label at the end of each row shows the exact date shift. Dotted red line = today."
